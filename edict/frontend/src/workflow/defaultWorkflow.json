@@ -1,0 +1,66 @@
+{
+  "id": "default-dynamic-court-workflow",
+  "name": "默认动态朝堂工作流",
+  "version": 1,
+  "entryAgentId": "taizi",
+  "summaryAgentId": "taizi",
+  "stages": [
+    {
+      "id": "plan",
+      "label": "拟旨规划",
+      "agentIds": ["zhongshu"],
+      "required": true
+    },
+    {
+      "id": "review",
+      "label": "封驳复核",
+      "agentIds": ["menxia"],
+      "required": true
+    },
+    {
+      "id": "dispatch",
+      "label": "领旨派发",
+      "agentIds": ["shangshu"],
+      "required": true
+    }
+  ],
+  "routingRules": [
+    {
+      "id": "finance-data",
+      "label": "预算数据",
+      "keywords": ["预算", "资金", "成本", "报表", "数据", "指标", "统计", "资源"],
+      "agentIds": ["hubu"]
+    },
+    {
+      "id": "document-communication",
+      "label": "文档规范",
+      "keywords": ["文档", "公告", "规范", "邮件", "话术", "报告", "发布", "沟通"],
+      "agentIds": ["libu"]
+    },
+    {
+      "id": "engineering-code",
+      "label": "工程代码",
+      "keywords": ["代码", "接口", "bug", "测试", "实现", "重构", "前端", "后端", "系统", "功能"],
+      "agentIds": ["bingbu"]
+    },
+    {
+      "id": "security-audit",
+      "label": "安全审计",
+      "keywords": ["安全", "合规", "审计", "权限", "风险", "漏洞", "校验", "红线"],
+      "agentIds": ["xingbu"]
+    },
+    {
+      "id": "infra-ops",
+      "label": "部署运维",
+      "keywords": ["部署", "服务器", "环境", "端口", "容器", "脚本", "监控", "运维"],
+      "agentIds": ["gongbu"]
+    },
+    {
+      "id": "organization-agent",
+      "label": "组织人事",
+      "keywords": ["人员", "培训", "组织", "职责", "Agent", "官职", "团队", "权限"],
+      "agentIds": ["libu_hr"]
+    }
+  ],
+  "fallbackAgentIds": ["libu", "bingbu"]
+}
