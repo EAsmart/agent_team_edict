@@ -55,7 +55,12 @@ BASE = pathlib.Path(__file__).parent
 DIST = BASE / 'dist'          # React 构建产物 (npm run build)
 DATA = BASE.parent / "data"
 SCRIPTS = BASE.parent / 'scripts'
-RUNTIME_WORKSPACE_ROOT = BASE.parent / '.runtime_workspaces'
+RUNTIME_DATA = BASE.parent / '.runtime_data'
+RUNTIME_CONFIGS = RUNTIME_DATA / 'configs'
+RUNTIME_TASKS = RUNTIME_DATA / 'tasks'
+RUNTIME_EVENTS = RUNTIME_DATA / 'events'
+RUNTIME_ARTIFACTS = RUNTIME_DATA / 'artifacts'
+RUNTIME_WORKSPACES = RUNTIME_DATA / 'workspaces'
 _ACTIVE_TASK_DATA_DIR = None
 
 # 静态资源 MIME 类型
@@ -316,9 +321,10 @@ def handle_runtime_shell(body):
     if executable not in allowed:
         return {'ok': False, 'error': f'命令 {executable} 不在白名单内'}
 
-    workspace = (RUNTIME_WORKSPACE_ROOT / task_id).resolve()
+    _runtime_init_dirs()
+    workspace = (RUNTIME_WORKSPACES / task_id).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
-    root = RUNTIME_WORKSPACE_ROOT.resolve()
+    root = RUNTIME_WORKSPACES.resolve()
     if not str(workspace).startswith(str(root)):
         return {'ok': False, 'error': '工作目录越过 Runtime 根目录'}
 
@@ -349,6 +355,301 @@ def handle_runtime_shell(body):
         return {'ok': False, 'command': command, 'cwd': str(workspace), 'stdout': '', 'stderr': '命令执行超时', 'exitCode': 124}
     except Exception as e:
         return {'ok': False, 'command': command, 'cwd': str(workspace), 'stdout': '', 'stderr': str(e), 'exitCode': 1}
+
+
+def _runtime_init_dirs():
+    """初始化第七阶段 Runtime 持久化目录，目录本身不提交到 Git。"""
+    for path in (RUNTIME_CONFIGS, RUNTIME_TASKS, RUNTIME_EVENTS, RUNTIME_ARTIFACTS, RUNTIME_WORKSPACES):
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def _runtime_safe_id(value, fallback='runtime'):
+    """把任务 ID 规范为安全文件名，避免路径穿越。"""
+    value = str(value or fallback).strip()
+    if not _SAFE_NAME_RE.match(value):
+        raise ValueError('id 含非法字符')
+    return value
+
+
+def _runtime_json_read(path, default):
+    """读取 Runtime JSON 文件，失败时返回默认值。"""
+    try:
+        if not path.exists():
+            return default
+        return json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return default
+
+
+def _runtime_json_write(path, data):
+    """写入 Runtime JSON 文件，使用临时文件减少半写入风险。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    tmp.replace(path)
+
+
+def _runtime_models_path():
+    """模型配置固定保存到 .runtime_data/configs/models.json。"""
+    _runtime_init_dirs()
+    return RUNTIME_CONFIGS / 'models.json'
+
+
+def _mask_secret(value):
+    """后端返回配置和错误时不泄露完整 API Key。"""
+    value = str(value or '')
+    if not value:
+        return ''
+    if len(value) <= 8:
+        return '***'
+    return f'{value[:4]}***{value[-4:]}'
+
+
+def _sanitize_text(text, config=None):
+    """清理错误文本中的 API Key，避免后端错误泄露密钥。"""
+    text = str(text or '')
+    config = config or {}
+    key = str(config.get('apiKey') or '')
+    if key:
+        text = text.replace(key, _mask_secret(key))
+    return text[:2000]
+
+
+def _runtime_public_config(config):
+    """返回给前端的配置只包含脱敏信息。"""
+    config = dict(config or {})
+    key = str(config.get('apiKey') or '')
+    config['apiKey'] = ''
+    config['apiKeyMasked'] = _mask_secret(key)
+    config['hasApiKey'] = bool(key)
+    return config
+
+
+def runtime_get_config():
+    """GET /api/runtime/config：读取脱敏后的模型配置。"""
+    config = _runtime_json_read(_runtime_models_path(), {})
+    if not config:
+        config = {
+            'provider': 'openai-compatible',
+            'baseUrl': '',
+            'apiKey': '',
+            'model': '',
+            'mode': 'mock',
+            'agentModels': {'taizi': '', 'zhongshu': ''},
+            'updatedAt': '',
+        }
+    return {'ok': True, 'config': _runtime_public_config(config)}
+
+
+def runtime_save_config(body):
+    """POST /api/runtime/config：保存模型配置，API Key 只写入本机 .runtime_data。"""
+    _runtime_init_dirs()
+    current = _runtime_json_read(_runtime_models_path(), {})
+    incoming = body if isinstance(body, dict) else {}
+    next_config = {
+        'provider': incoming.get('provider') or current.get('provider') or 'openai-compatible',
+        'baseUrl': str(incoming.get('baseUrl') or current.get('baseUrl') or '').rstrip('/'),
+        'apiKey': current.get('apiKey') or '',
+        'model': incoming.get('model') or current.get('model') or '',
+        'mode': incoming.get('mode') if incoming.get('mode') in ('mock', 'real') else current.get('mode', 'mock'),
+        'agentModels': incoming.get('agentModels') if isinstance(incoming.get('agentModels'), dict) else current.get('agentModels', {}),
+        'updatedAt': now_iso(),
+    }
+    if 'apiKey' in incoming and str(incoming.get('apiKey') or '').strip():
+        next_config['apiKey'] = str(incoming.get('apiKey')).strip()
+    _runtime_json_write(_runtime_models_path(), next_config)
+    return {'ok': True, 'message': 'Runtime 模型配置已保存', 'config': _runtime_public_config(next_config)}
+
+
+def _runtime_task_path(task_id):
+    """返回任务 JSON 文件路径。"""
+    return RUNTIME_TASKS / f'{_runtime_safe_id(task_id)}.json'
+
+
+def _runtime_event_path(task_id):
+    """返回事件日志 JSONL 文件路径。"""
+    return RUNTIME_EVENTS / f'{_runtime_safe_id(task_id)}.jsonl'
+
+
+def _runtime_artifact_dir(task_id):
+    """返回任务产物目录。"""
+    return RUNTIME_ARTIFACTS / _runtime_safe_id(task_id)
+
+
+def runtime_list_tasks():
+    """GET /api/runtime/tasks：列出 Runtime 持久化任务。"""
+    _runtime_init_dirs()
+    tasks = []
+    for path in sorted(RUNTIME_TASKS.glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True):
+        data = _runtime_json_read(path, {})
+        if data:
+            tasks.append(data)
+    return {'ok': True, 'tasks': tasks}
+
+
+def runtime_create_task(body):
+    """POST /api/runtime/tasks：保存单个任务，并创建独立工作区。"""
+    _runtime_init_dirs()
+    task = body.get('task') if isinstance(body.get('task'), dict) else body
+    task_id = _runtime_safe_id(task.get('id') or f'RUNTIME-{datetime.datetime.now().strftime("%Y%m%d%H%M%S")}')
+    now = now_iso()
+    saved = {
+        **task,
+        'id': task_id,
+        'status': task.get('status', 'created'),
+        'createdAt': task.get('createdAt') or now,
+        'updatedAt': now,
+        'workspace': str((RUNTIME_WORKSPACES / task_id).resolve()),
+    }
+    (RUNTIME_WORKSPACES / task_id).mkdir(parents=True, exist_ok=True)
+    _runtime_json_write(_runtime_task_path(task_id), saved)
+    runtime_append_event({'taskId': task_id, 'type': 'task.created', 'from': '皇上', 'to': '太子', 'content': f"Runtime 任务已保存：{saved.get('title', task_id)}"})
+    return {'ok': True, 'task': saved}
+
+
+def runtime_get_task(task_id):
+    """GET /api/runtime/tasks/{taskId}：读取任务和事件日志。"""
+    try:
+        task_id = _runtime_safe_id(task_id)
+    except ValueError as e:
+        return {'ok': False, 'error': str(e)}, 400
+    task = _runtime_json_read(_runtime_task_path(task_id), None)
+    if not task:
+        return {'ok': False, 'error': 'task not found'}, 404
+    return {'ok': True, 'task': task, 'events': runtime_read_events(task_id)}
+
+
+def runtime_append_event(body):
+    """POST /api/runtime/events：追加 JSONL 事件日志。"""
+    _runtime_init_dirs()
+    task_id = _runtime_safe_id(body.get('taskId') or body.get('task_id') or 'global')
+    event = {
+        'id': body.get('id') or f'evt-{datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")}',
+        'taskId': task_id,
+        'type': body.get('type') or 'runtime.event',
+        'from': body.get('from') or body.get('source') or 'runtime',
+        'to': body.get('to') or 'runtime',
+        'content': _sanitize_text(body.get('content') or body.get('message') or ''),
+        'payload': body.get('payload') if isinstance(body.get('payload'), dict) else {},
+        'createdAt': body.get('createdAt') or now_iso(),
+    }
+    path = _runtime_event_path(task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a', encoding='utf-8') as f:
+        f.write(json.dumps(event, ensure_ascii=False) + '\n')
+    return {'ok': True, 'event': event}
+
+
+def runtime_read_events(task_id):
+    """读取指定任务 JSONL 事件日志。"""
+    path = _runtime_event_path(task_id)
+    if not path.exists():
+        return []
+    events = []
+    for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+        try:
+            events.append(json.loads(line))
+        except Exception:
+            pass
+    return events
+
+
+def runtime_save_artifact(task_id, agent_id, artifact_type, title, content):
+    """把模型输出或 Runtime 产物保存到 .runtime_data/artifacts/{taskId}/。"""
+    task_id = _runtime_safe_id(task_id)
+    safe_agent = _runtime_safe_id(agent_id or 'runtime')
+    safe_type = _runtime_safe_id(artifact_type or 'markdown')
+    artifact_id = f'art-{datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")}'
+    artifact = {
+        'id': artifact_id,
+        'taskId': task_id,
+        'agentId': safe_agent,
+        'type': safe_type,
+        'title': title or artifact_id,
+        'content': content or '',
+        'createdAt': now_iso(),
+    }
+    out_dir = _runtime_artifact_dir(task_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _runtime_json_write(out_dir / f'{artifact_id}.json', artifact)
+    return artifact
+
+
+def runtime_list_artifacts(task_id):
+    """GET /api/runtime/artifacts/{taskId}：列出任务产物。"""
+    try:
+        task_id = _runtime_safe_id(task_id)
+    except ValueError as e:
+        return {'ok': False, 'error': str(e)}, 400
+    artifacts = []
+    for path in sorted(_runtime_artifact_dir(task_id).glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True):
+        data = _runtime_json_read(path, {})
+        if data:
+            artifacts.append(data)
+    return {'ok': True, 'taskId': task_id, 'artifacts': artifacts}
+
+
+def _runtime_model_config(body):
+    """组合请求配置和本地保存配置，请求配置优先但不要求前端传 API Key。"""
+    saved = _runtime_json_read(_runtime_models_path(), {})
+    incoming = body.get('config') if isinstance(body.get('config'), dict) else body
+    return {
+        'provider': incoming.get('provider') or saved.get('provider') or 'openai-compatible',
+        'baseUrl': str(incoming.get('baseUrl') or saved.get('baseUrl') or '').rstrip('/'),
+        'apiKey': incoming.get('apiKey') or saved.get('apiKey') or '',
+        'model': incoming.get('model') or saved.get('model') or '',
+    }
+
+
+def runtime_openai_chat(body, test_only=False):
+    """OpenAI-compatible 代理：POST {baseUrl}/chat/completions，不让前端直连模型 API。"""
+    config = _runtime_model_config(body)
+    if config.get('provider') != 'openai-compatible':
+        return {'ok': False, 'error': '当前仅支持 provider=openai-compatible'}
+    if not config.get('baseUrl') or not validate_url(config['baseUrl'], allowed_schemes=('http', 'https')):
+        return {'ok': False, 'error': 'baseUrl 无效'}
+    if not config.get('apiKey'):
+        return {'ok': False, 'error': 'apiKey 未配置'}
+    if not config.get('model'):
+        return {'ok': False, 'error': 'model 未配置'}
+
+    messages = body.get('messages')
+    if test_only:
+        messages = [{'role': 'user', 'content': '请用一句话回复：连接成功'}]
+    if not isinstance(messages, list) or not messages:
+        return {'ok': False, 'error': 'messages 必须是非空数组'}
+
+    task_id = str(body.get('taskId') or 'global')
+    agent_id = str(body.get('agentId') or 'runtime')
+    url = config['baseUrl'].rstrip('/') + '/chat/completions'
+    payload = {'model': config['model'], 'messages': messages}
+    timeout = int(body.get('timeoutSec') or 45)
+    timeout = max(5, min(timeout, 120))
+    started = now_iso()
+    runtime_append_event({'taskId': task_id, 'type': 'model.request', 'from': agent_id, 'to': 'openai-compatible', 'content': f"调用模型 {config['model']}：{len(messages)} 条 messages", 'payload': {'baseUrl': config['baseUrl'], 'model': config['model'], 'test': test_only}})
+
+    req = Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+        headers={
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Authorization': f"Bearer {config['apiKey']}",
+        },
+        method='POST',
+    )
+    try:
+        resp = urlopen(req, timeout=timeout)
+        raw = resp.read(2 * 1024 * 1024).decode('utf-8', errors='replace')
+        data = json.loads(raw) if raw else {}
+        message = (((data.get('choices') or [{}])[0].get('message') or {}).get('content') or '')
+        artifact = runtime_save_artifact(task_id, agent_id, 'markdown', f'{agent_id} 模型输出', message or raw[:20000])
+        runtime_append_event({'taskId': task_id, 'type': 'model.response', 'from': 'openai-compatible', 'to': agent_id, 'content': message[:1000] or '模型返回成功', 'payload': {'artifactId': artifact['id'], 'startedAt': started, 'finishedAt': now_iso()}})
+        return {'ok': True, 'message': message, 'raw': data, 'artifact': artifact, 'config': _runtime_public_config(config)}
+    except Exception as e:
+        error = _sanitize_text(e, config)
+        runtime_append_event({'taskId': task_id, 'type': 'model.error', 'from': 'openai-compatible', 'to': agent_id, 'content': error, 'payload': {'startedAt': started, 'finishedAt': now_iso()}})
+        return {'ok': False, 'error': error}
 
 
 def read_skill_content(agent_id, skill_name):
@@ -2482,6 +2783,24 @@ class Handler(BaseHTTPRequestHandler):
             checks['dataWritable'] = os.access(str(task_data_dir), os.W_OK)
             all_ok = all(checks.values())
             self.send_json({'status': 'ok' if all_ok else 'degraded', 'ts': now_iso(), 'checks': checks})
+        elif p == '/api/runtime/config':
+            self.send_json(runtime_get_config())
+        elif p == '/api/runtime/tasks':
+            self.send_json(runtime_list_tasks())
+        elif p.startswith('/api/runtime/tasks/'):
+            task_id = p.replace('/api/runtime/tasks/', '')
+            data = runtime_get_task(task_id)
+            if isinstance(data, tuple):
+                self.send_json(data[0], data[1])
+            else:
+                self.send_json(data)
+        elif p.startswith('/api/runtime/artifacts/'):
+            task_id = p.replace('/api/runtime/artifacts/', '')
+            data = runtime_list_artifacts(task_id)
+            if isinstance(data, tuple):
+                self.send_json(data[0], data[1])
+            else:
+                self.send_json(data)
         elif p == '/api/live-status':
             task_data_dir = get_task_data_dir()
             self.send_json(read_json(task_data_dir / 'live_status.json'))
@@ -2642,6 +2961,32 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == '/api/runtime-shell':
             self.send_json(handle_runtime_shell(body))
+            return
+
+        if p == '/api/runtime/config':
+            self.send_json(runtime_save_config(body))
+            return
+
+        if p == '/api/runtime/tasks':
+            try:
+                self.send_json(runtime_create_task(body))
+            except ValueError as e:
+                self.send_json({'ok': False, 'error': str(e)}, 400)
+            return
+
+        if p == '/api/runtime/events':
+            try:
+                self.send_json(runtime_append_event(body))
+            except ValueError as e:
+                self.send_json({'ok': False, 'error': str(e)}, 400)
+            return
+
+        if p == '/api/runtime/model/test':
+            self.send_json(runtime_openai_chat(body, test_only=True))
+            return
+
+        if p == '/api/runtime/model/chat':
+            self.send_json(runtime_openai_chat(body, test_only=False))
             return
 
         if p == '/api/morning-config':

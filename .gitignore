@@ -43,6 +43,7 @@ dashboard/dist/
 # Backups
 *.bak*
 data
+.runtime_data/
 
 # Local dev/test scripts
 _*.py

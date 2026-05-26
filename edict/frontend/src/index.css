@@ -1383,9 +1383,17 @@ body {
 }
 
 .local-config-form input,
-.local-config-form textarea {
+.local-config-form textarea,
+.local-config-form select {
   padding: 9px 10px;
   font-size: 12px;
+}
+
+.local-config-form select {
+  color: #e5ecff;
+  border: 1px solid rgba(106, 158, 255, .24);
+  border-radius: 8px;
+  background: rgba(5, 10, 22, .76);
 }
 
 .local-config-form input[type="checkbox"] {
@@ -1401,6 +1409,27 @@ body {
 
 .log-card {
   margin-bottom: 6px;
+}
+
+.runtime-model-card {
+  margin: 18px 0;
+}
+
+.runtime-config-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 16px;
+}
+
+.runtime-config-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.model-call-log {
+  margin-top: 12px;
 }
 
 .console-log {

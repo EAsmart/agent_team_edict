@@ -107,6 +107,26 @@ export const api = {
     postJ<ActionResult>(`${API_BASE}/api/court-discuss/destroy`, { sessionId }),
   courtDiscussFate: () =>
     fetchJ<{ ok: boolean; event: string }>(`${API_BASE}/api/court-discuss/fate`),
+
+  // ── 第七阶段 Runtime 持久化与模型代理 ──
+  runtimeConfig: () =>
+    fetchJ<RuntimeConfigResult>(`${API_BASE}/api/runtime/config`),
+  saveRuntimeConfig: (config: RuntimeModelConfig) =>
+    postJ<RuntimeConfigResult>(`${API_BASE}/api/runtime/config`, config),
+  runtimeTasks: () =>
+    fetchJ<RuntimeTasksResult>(`${API_BASE}/api/runtime/tasks`),
+  saveRuntimeTask: (task: RuntimeTaskPayload) =>
+    postJ<ActionResult & { task?: RuntimeTaskPayload }>(`${API_BASE}/api/runtime/tasks`, { task }),
+  runtimeTask: (taskId: string) =>
+    fetchJ<RuntimeTaskResult>(`${API_BASE}/api/runtime/tasks/${encodeURIComponent(taskId)}`),
+  runtimeEvent: (event: RuntimeEventPayload) =>
+    postJ<ActionResult & { event?: RuntimeEventPayload }>(`${API_BASE}/api/runtime/events`, event),
+  runtimeArtifacts: (taskId: string) =>
+    fetchJ<RuntimeArtifactsResult>(`${API_BASE}/api/runtime/artifacts/${encodeURIComponent(taskId)}`),
+  runtimeModelTest: (payload: RuntimeModelChatPayload) =>
+    postJ<RuntimeModelChatResult>(`${API_BASE}/api/runtime/model/test`, payload),
+  runtimeModelChat: (payload: RuntimeModelChatPayload) =>
+    postJ<RuntimeModelChatResult>(`${API_BASE}/api/runtime/model/chat`, payload),
 };
 
 // ── Types ──
@@ -429,4 +449,89 @@ export interface CourtDiscussResult {
   scene_note?: string;
   total_messages?: number;
   error?: string;
+}
+
+// ── 第七阶段 Runtime Types ──
+
+export interface RuntimeModelConfig {
+  provider: 'openai-compatible';
+  baseUrl: string;
+  apiKey?: string;
+  apiKeyMasked?: string;
+  hasApiKey?: boolean;
+  model: string;
+  mode: 'mock' | 'real';
+  agentModels?: Record<string, string>;
+  updatedAt?: string;
+}
+
+export interface RuntimeConfigResult extends ActionResult {
+  config: RuntimeModelConfig;
+}
+
+export interface RuntimeTaskPayload {
+  id: string;
+  title: string;
+  content: string;
+  status?: string;
+  currentDepartment?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  workspace?: string;
+  [key: string]: unknown;
+}
+
+export interface RuntimeEventPayload {
+  id?: string;
+  taskId: string;
+  type: string;
+  from?: string;
+  to?: string;
+  content: string;
+  payload?: Record<string, unknown>;
+  createdAt?: string;
+}
+
+export interface RuntimeArtifact {
+  id: string;
+  taskId: string;
+  agentId: string;
+  type: string;
+  title: string;
+  content: string;
+  createdAt: string;
+}
+
+export interface RuntimeTasksResult extends ActionResult {
+  tasks: RuntimeTaskPayload[];
+}
+
+export interface RuntimeTaskResult extends ActionResult {
+  task?: RuntimeTaskPayload;
+  events?: RuntimeEventPayload[];
+}
+
+export interface RuntimeArtifactsResult extends ActionResult {
+  taskId?: string;
+  artifacts?: RuntimeArtifact[];
+}
+
+export interface RuntimeModelMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+export interface RuntimeModelChatPayload {
+  taskId?: string;
+  agentId?: string;
+  config?: Partial<RuntimeModelConfig>;
+  messages?: RuntimeModelMessage[];
+  timeoutSec?: number;
+}
+
+export interface RuntimeModelChatResult extends ActionResult {
+  message?: string;
+  raw?: unknown;
+  artifact?: RuntimeArtifact;
+  config?: RuntimeModelConfig;
 }

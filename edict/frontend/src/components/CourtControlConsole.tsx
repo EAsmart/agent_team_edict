@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
-import { type AgentInfo, type OfficialInfo, type Task } from '../api';
+import { api, type AgentInfo, type OfficialInfo, type RuntimeModelConfig, type Task } from '../api';
 import { DEPTS, isArchived, isEdict, useStore } from '../store';
 import { createCourtTask, createMockCourtRuntime, type AgentMessage, type CourtTask } from '../taskBus';
 
@@ -59,6 +59,13 @@ type RuntimeEventLog = {
   content: string;
 };
 
+type ModelCallLog = {
+  at: string;
+  agent: string;
+  status: 'ok' | 'err' | 'info';
+  content: string;
+};
+
 const LOCAL_CONFIG_KEY = 'edict.localModelConfigs.v1';
 
 const EMPTY_CONFIG: LocalModelConfig = {
@@ -68,6 +75,18 @@ const EMPTY_CONFIG: LocalModelConfig = {
   modelName: '',
   systemPrompt: '',
   enabled: true,
+};
+
+const DEFAULT_RUNTIME_CONFIG: RuntimeModelConfig = {
+  provider: 'openai-compatible',
+  baseUrl: '',
+  apiKey: '',
+  model: '',
+  mode: 'mock',
+  agentModels: {
+    taizi: '',
+    zhongshu: '',
+  },
 };
 
 // 第一阶段保留原有皇上、太子、三省、六部体系，只补充用于 UI 展示的职责文案。
@@ -236,6 +255,11 @@ function messageToRuntimeLog(message: AgentMessage): RuntimeEventLog {
   };
 }
 
+function componentWait(ms: number) {
+  // 真实模型最小闭环中仍用轻量延迟保留朝堂流转动画节奏。
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 export default function CourtControlConsole() {
   const liveStatus = useStore((s) => s.liveStatus);
   const agentConfig = useStore((s) => s.agentConfig);
@@ -254,11 +278,37 @@ export default function CourtControlConsole() {
   const [expandedSteps, setExpandedSteps] = useState<Record<string, boolean>>({});
   const runtimeRef = useRef(createMockCourtRuntime());
   const [runtimeLogs, setRuntimeLogs] = useState<RuntimeEventLog[]>([]);
+  const [runtimeConfig, setRuntimeConfig] = useState<RuntimeModelConfig>(DEFAULT_RUNTIME_CONFIG);
+  const [modelCallLogs, setModelCallLogs] = useState<ModelCallLog[]>([]);
+  const [savingRuntimeConfig, setSavingRuntimeConfig] = useState(false);
+  const [testingModel, setTestingModel] = useState(false);
 
   useEffect(() => {
     loadAgentConfig();
     loadOfficials();
     setLocalConfigs(readLocalConfigs());
+    api.runtimeConfig()
+      .then((result) => {
+        if (result.ok && result.config) {
+          setRuntimeConfig({
+            ...DEFAULT_RUNTIME_CONFIG,
+            ...result.config,
+            apiKey: '',
+            agentModels: {
+              ...DEFAULT_RUNTIME_CONFIG.agentModels,
+              ...(result.config.agentModels || {}),
+            },
+          });
+        }
+      })
+      .catch(() => {
+        setModelCallLogs((prev) => [{
+          at: new Date().toLocaleString('zh-CN', { hour12: false }),
+          agent: 'Runtime',
+          status: 'err',
+          content: '读取后端 Runtime 配置失败，当前保持 Mock 模式。',
+        }, ...prev]);
+      });
   }, [loadAgentConfig, loadOfficials]);
 
   useEffect(() => {
@@ -362,8 +412,211 @@ export default function CourtControlConsole() {
     toast('本地模型配置已保存', 'ok');
   };
 
-  const handleGenerateFlow = () => {
-    // 输入圣旨后创建 CourtTask，并交给 mock Agent Runtime 推进。
+  const pushModelLog = (agent: string, status: ModelCallLog['status'], content: string) => {
+    // 模型调用日志只记录脱敏摘要，不展示完整 API Key。
+    setModelCallLogs((prev) => [{
+      at: new Date().toLocaleString('zh-CN', { hour12: false }),
+      agent,
+      status,
+      content,
+    }, ...prev].slice(0, 60));
+  };
+
+  const updateRuntimeConfig = (field: keyof RuntimeModelConfig, value: string) => {
+    // Runtime 配置落到后端 .runtime_data，React 状态只负责表单展示。
+    setRuntimeConfig((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const updateRuntimeAgentModel = (agentId: string, value: string) => {
+    // Agent 模型选择先支持太子和中书省，后续可扩展到全体官职。
+    setRuntimeConfig((prev) => ({
+      ...prev,
+      agentModels: {
+        ...(prev.agentModels || {}),
+        [agentId]: value,
+      },
+    }));
+  };
+
+  const handleSaveRuntimeConfig = async () => {
+    // 保存真实模型配置到后端，API Key 不进入前端日志。
+    setSavingRuntimeConfig(true);
+    try {
+      const result = await api.saveRuntimeConfig(runtimeConfig);
+      if (result.ok) {
+        setRuntimeConfig({
+          ...DEFAULT_RUNTIME_CONFIG,
+          ...result.config,
+          apiKey: '',
+          agentModels: {
+            ...DEFAULT_RUNTIME_CONFIG.agentModels,
+            ...(result.config.agentModels || {}),
+          },
+        });
+        pushModelLog('Runtime', 'ok', `模型配置已保存，Key：${result.config.apiKeyMasked || '未填写'}`);
+        toast('后端 Runtime 模型配置已保存', 'ok');
+      } else {
+        pushModelLog('Runtime', 'err', result.error || '保存模型配置失败');
+        toast(result.error || '保存模型配置失败', 'err');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      pushModelLog('Runtime', 'err', message);
+      toast('保存模型配置失败', 'err');
+    } finally {
+      setSavingRuntimeConfig(false);
+    }
+  };
+
+  const handleTestRuntimeModel = async () => {
+    // 测试连接通过 dashboard/server.py 代理请求模型 API。
+    setTestingModel(true);
+    try {
+      const result = await api.runtimeModelTest({
+        agentId: 'taizi',
+        taskId: 'global',
+        config: {
+          ...runtimeConfig,
+          model: runtimeConfig.agentModels?.taizi || runtimeConfig.model,
+        },
+      });
+      if (result.ok) {
+        pushModelLog('太子', 'ok', `测试连接成功：${result.message || '模型有返回'}`);
+        toast('模型连接测试成功', 'ok');
+      } else {
+        pushModelLog('太子', 'err', result.error || '模型连接测试失败');
+        toast(result.error || '模型连接测试失败', 'err');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      pushModelLog('太子', 'err', message);
+      toast('模型连接测试失败', 'err');
+    } finally {
+      setTestingModel(false);
+    }
+  };
+
+  const appendRuntimeEvent = async (taskId: string, type: string, from: string, to: string, content: string, payload: Record<string, unknown> = {}) => {
+    // 事件写入后端 EventStore，失败时只记录前端日志，不阻断 UI 流转。
+    try {
+      await api.runtimeEvent({ taskId, type, from, to, content, payload });
+    } catch (error) {
+      pushModelLog('EventStore', 'err', error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const callRuntimeModel = async (task: CourtTask, agentId: 'taizi' | 'zhongshu', title: string, prompt: string) => {
+    // 真实模型调用统一走后端代理，输出会在后端保存为 Artifact。
+    const agentName = agentId === 'taizi' ? '太子' : '中书省';
+    pushModelLog(agentName, 'info', `开始调用真实模型：${title}`);
+    const result = await api.runtimeModelChat({
+      taskId: task.id,
+      agentId,
+      config: {
+        ...runtimeConfig,
+        model: runtimeConfig.agentModels?.[agentId] || runtimeConfig.model,
+      },
+      messages: [
+        { role: 'system', content: agentId === 'taizi' ? '你是太子，负责分析圣旨并制定朝堂调度策略。' : '你是中书省，负责拆解圣旨并形成可执行方案。' },
+        { role: 'user', content: prompt },
+      ],
+      timeoutSec: 60,
+    });
+    if (!result.ok) {
+      const error = result.error || `${agentName} 模型调用失败`;
+      pushModelLog(agentName, 'err', error);
+      throw new Error(error);
+    }
+    pushModelLog(agentName, 'ok', `${title} 完成，产物：${result.artifact?.id || '已保存'}`);
+    return result.message || '模型返回为空，但调用成功。';
+  };
+
+  const runRealRuntimeFlow = async (task: CourtTask) => {
+    // 第七阶段真实模型最小闭环：太子和中书省调用真实模型，其余官职保留 mock 流转。
+    try {
+      await api.saveRuntimeTask(task);
+      await appendRuntimeEvent(task.id, 'task.persisted', 'Dashboard', 'RuntimeStore', `任务已保存到 .runtime_data/tasks/${task.id}.json`);
+
+      const taiziOutput = await callRuntimeModel(
+        task,
+        'taizi',
+        '圣旨分析',
+        `请分析这道圣旨，给出动态目标、需调用的部门和执行重点：\n\n${task.content}`,
+      );
+      runtimeRef.current.bus.updateTask(task.id, { status: 'running', currentDepartment: '太子' }, {
+        from: '太子',
+        to: '中书省',
+        type: 'task.log',
+        content: `太子真实模型分析：${taiziOutput}`,
+      });
+      await appendRuntimeEvent(task.id, 'model.taizi.completed', '太子', '中书省', taiziOutput);
+      await componentWait(800);
+
+      const zhongshuOutput = await callRuntimeModel(
+        task,
+        'zhongshu',
+        '任务拆解',
+        `太子分析如下：\n${taiziOutput}\n\n请把圣旨拆解为可执行步骤：\n${task.content}`,
+      );
+      runtimeRef.current.bus.updateTask(task.id, { status: 'running', currentDepartment: '中书省' }, {
+        from: '中书省',
+        to: '门下省',
+        type: 'task.log',
+        content: `中书省真实模型拆解：${zhongshuOutput}`,
+      });
+      await appendRuntimeEvent(task.id, 'model.zhongshu.completed', '中书省', '门下省', zhongshuOutput);
+      await componentWait(900);
+
+      runtimeRef.current.bus.updateTask(task.id, { status: 'running', currentDepartment: '门下省' }, {
+        from: '门下省',
+        to: '尚书省',
+        type: 'task.log',
+        content: '门下省封驳：真实模型输出已复核，风险可控，准奏继续。',
+      });
+      await appendRuntimeEvent(task.id, 'agent.mock.menxia', '门下省', '尚书省', '门下省完成 mock 复核');
+      await componentWait(900);
+
+      runtimeRef.current.bus.updateTask(task.id, { status: 'running', currentDepartment: '尚书省' }, {
+        from: '尚书省',
+        to: '六部',
+        type: 'task.log',
+        content: '尚书省领旨：已按真实模型拆解结果派发六部。',
+      });
+      await appendRuntimeEvent(task.id, 'agent.mock.shangshu', '尚书省', '六部', '尚书省完成 mock 派发');
+      await componentWait(900);
+
+      runtimeRef.current.bus.updateTask(task.id, { status: 'running', currentDepartment: '六部' }, {
+        from: '六部',
+        to: '太子',
+        type: 'task.log',
+        content: '六部执行：暂以 mock 执行补齐闭环，模型产物已保存。',
+      });
+      await appendRuntimeEvent(task.id, 'agent.mock.liubu', '六部', '太子', '六部完成 mock 执行');
+      await componentWait(900);
+
+      runtimeRef.current.bus.updateTask(task.id, { status: 'completed', currentDepartment: '太子' }, {
+        from: '太子',
+        to: '皇上',
+        type: 'task.completed',
+        content: '太子汇总：真实模型最小闭环完成，太子与中书省输出已保存为 Artifact。',
+      });
+      await appendRuntimeEvent(task.id, 'task.completed', '太子', '皇上', '真实模型最小闭环完成');
+      pushModelLog('Runtime', 'ok', `${task.id} 已完成真实模型最小闭环`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      runtimeRef.current.bus.updateTask(task.id, { status: 'blocked', currentDepartment: '太子' }, {
+        from: 'Runtime',
+        to: '太子',
+        type: 'task.log',
+        content: `真实模型流程中断：${message}`,
+      });
+      await appendRuntimeEvent(task.id, 'task.blocked', 'Runtime', '太子', message);
+      toast('真实模型流程中断，详见模型调用日志', 'err');
+    }
+  };
+
+  const handleGenerateFlow = async () => {
+    // 输入圣旨后创建 CourtTask；Mock 模式走前端 Runtime，真实模式走后端持久化和模型代理。
     const summary = decreeText.trim();
     if (!summary) {
       toast('请先输入圣旨内容', 'err');
@@ -373,8 +626,13 @@ export default function CourtControlConsole() {
     setFlowText(`任务ID：${task.id}\n创建时间：${task.createdAt}\n需求：${summary}\n${FLOW_STEPS.map((step, index) => `${index + 1}. ${step}`).join('\n')}`);
     setDecreeText('');
     runtimeRef.current.bus.createTask(task);
-    runtimeRef.current.orchestrator.receiveTask(task);
-    toast(`${task.id} 已进入 TaskBus，Agent Runtime 开始流转`, 'ok');
+    if (runtimeConfig.mode === 'real') {
+      void runRealRuntimeFlow(task);
+      toast(`${task.id} 已进入真实模型 Runtime，开始持久化流转`, 'ok');
+    } else {
+      runtimeRef.current.orchestrator.receiveTask(task);
+      toast(`${task.id} 已进入 TaskBus，Agent Runtime 开始流转`, 'ok');
+    }
   };
 
   const toggleStep = (taskId: string, stepName: string) => {
@@ -470,6 +728,68 @@ export default function CourtControlConsole() {
               </button>
             ))}
           </div>
+        </div>
+      </div>
+
+      <div className="console-card runtime-model-card">
+        <div className="console-card-head">
+          <span>🧠 真实模型配置面板</span>
+          <small>{runtimeConfig.mode === 'real' ? '真实模型模式' : 'Mock 模式'}</small>
+        </div>
+        <div className="local-config-form runtime-config-form">
+          <label>
+            <span>运行模式</span>
+            <select value={runtimeConfig.mode} onChange={(e) => updateRuntimeConfig('mode', e.target.value)}>
+              <option value="mock">Mock 模式</option>
+              <option value="real">真实模型模式</option>
+            </select>
+          </label>
+          <label>
+            <span>Provider</span>
+            <input value="openai-compatible" disabled />
+          </label>
+          <label>
+            <span>Base URL</span>
+            <input value={runtimeConfig.baseUrl} onChange={(e) => updateRuntimeConfig('baseUrl', e.target.value)} placeholder="https://api.example.com/v1" />
+          </label>
+          <label>
+            <span>API Key</span>
+            <input type="password" value={runtimeConfig.apiKey || ''} onChange={(e) => updateRuntimeConfig('apiKey', e.target.value)} placeholder={runtimeConfig.hasApiKey ? `已保存：${runtimeConfig.apiKeyMasked}` : '仅保存到后端 .runtime_data'} />
+          </label>
+          <label>
+            <span>默认模型</span>
+            <input value={runtimeConfig.model} onChange={(e) => updateRuntimeConfig('model', e.target.value)} placeholder="gpt-4o-mini / qwen-plus / deepseek-chat" />
+          </label>
+          <label>
+            <span>太子模型</span>
+            <input value={runtimeConfig.agentModels?.taizi || ''} onChange={(e) => updateRuntimeAgentModel('taizi', e.target.value)} placeholder="留空则使用默认模型" />
+          </label>
+          <label>
+            <span>中书省模型</span>
+            <input value={runtimeConfig.agentModels?.zhongshu || ''} onChange={(e) => updateRuntimeAgentModel('zhongshu', e.target.value)} placeholder="留空则使用默认模型" />
+          </label>
+          <div className="runtime-config-actions">
+            <button className="console-primary" onClick={handleSaveRuntimeConfig} disabled={savingRuntimeConfig}>
+              {savingRuntimeConfig ? '保存中...' : '保存配置'}
+            </button>
+            <button className="console-ghost" onClick={handleTestRuntimeModel} disabled={testingModel}>
+              {testingModel ? '测试中...' : '测试连接'}
+            </button>
+          </div>
+        </div>
+        <div className="console-log model-call-log">
+          {modelCallLogs.length === 0 ? (
+            <div className="log-empty">暂无模型调用日志。API Key 不会在此处完整显示。</div>
+          ) : (
+            modelCallLogs.map((line, index) => (
+              <div className={`log-line local ${line.status}`} key={`${line.at}-${line.agent}-${index}`}>
+                <code>{line.at.substring(11, 19) || '--:--:--'}</code>
+                <span>{line.status}</span>
+                <b>{line.agent}</b>
+                <em>{line.content}</em>
+              </div>
+            ))
+          )}
         </div>
       </div>
 
