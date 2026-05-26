@@ -422,6 +422,17 @@ def _runtime_public_config(config):
     config['apiKey'] = ''
     config['apiKeyMasked'] = _mask_secret(key)
     config['hasApiKey'] = bool(key)
+    public_models = []
+    for model in config.get('models') or []:
+        if not isinstance(model, dict):
+            continue
+        item = dict(model)
+        model_key = str(item.get('apiKey') or '')
+        item['apiKey'] = ''
+        item['apiKeyMasked'] = _mask_secret(model_key)
+        item['hasApiKey'] = bool(model_key)
+        public_models.append(item)
+    config['models'] = public_models
     return config
 
 
@@ -436,6 +447,7 @@ def runtime_get_config():
             'model': '',
             'mode': 'mock',
             'agentModels': {'taizi': '', 'zhongshu': ''},
+            'models': [],
             'updatedAt': '',
         }
     return {'ok': True, 'config': _runtime_public_config(config)}
@@ -446,6 +458,30 @@ def runtime_save_config(body):
     _runtime_init_dirs()
     current = _runtime_json_read(_runtime_models_path(), {})
     incoming = body if isinstance(body, dict) else {}
+    current_models = {
+        str(model.get('id')): model
+        for model in (current.get('models') or [])
+        if isinstance(model, dict) and model.get('id')
+    }
+    if isinstance(incoming.get('models'), list):
+        incoming_models = []
+        for raw in incoming.get('models'):
+            if not isinstance(raw, dict):
+                continue
+            model_id = _runtime_safe_id(raw.get('id') or f'model-{len(incoming_models) + 1}')
+            previous = current_models.get(model_id, {})
+            incoming_models.append({
+                'id': model_id,
+                'name': str(raw.get('name') or previous.get('name') or model_id).strip(),
+                'provider': raw.get('provider') or previous.get('provider') or 'openai-compatible',
+                'baseUrl': str(raw.get('baseUrl') or previous.get('baseUrl') or '').rstrip('/'),
+                'apiKey': str(raw.get('apiKey') or '').strip() or previous.get('apiKey') or '',
+                'model': str(raw.get('model') or previous.get('model') or '').strip(),
+                'enabled': raw.get('enabled') is not False,
+                'updatedAt': now_iso(),
+            })
+    else:
+        incoming_models = list(current_models.values())
     next_config = {
         'provider': incoming.get('provider') or current.get('provider') or 'openai-compatible',
         'baseUrl': str(incoming.get('baseUrl') or current.get('baseUrl') or '').rstrip('/'),
@@ -453,6 +489,7 @@ def runtime_save_config(body):
         'model': incoming.get('model') or current.get('model') or '',
         'mode': incoming.get('mode') if incoming.get('mode') in ('mock', 'real') else current.get('mode', 'mock'),
         'agentModels': incoming.get('agentModels') if isinstance(incoming.get('agentModels'), dict) else current.get('agentModels', {}),
+        'models': incoming_models,
         'updatedAt': now_iso(),
     }
     if 'apiKey' in incoming and str(incoming.get('apiKey') or '').strip():
@@ -554,6 +591,17 @@ def runtime_read_events(task_id):
     return events
 
 
+def runtime_get_events(task_id):
+    """GET /api/runtime/events/{taskId}: read event replay data without executing commands."""
+    try:
+        task_id = _runtime_safe_id(task_id)
+    except ValueError as e:
+        return {'ok': False, 'error': str(e)}, 400
+    events = runtime_read_events(task_id)
+    events.sort(key=lambda item: item.get('createdAt') or '')
+    return {'ok': True, 'taskId': task_id, 'events': events}
+
+
 def runtime_save_artifact(task_id, agent_id, artifact_type, title, content):
     """把模型输出或 Runtime 产物保存到 .runtime_data/artifacts/{taskId}/。"""
     task_id = _runtime_safe_id(task_id)
@@ -575,6 +623,27 @@ def runtime_save_artifact(task_id, agent_id, artifact_type, title, content):
     return artifact
 
 
+def runtime_create_artifact(body):
+    """POST /api/runtime/artifacts: save a display-only runtime artifact."""
+    _runtime_init_dirs()
+    artifact = runtime_save_artifact(
+        body.get('taskId') or 'global',
+        body.get('agentId') or 'runtime',
+        body.get('type') or 'text',
+        body.get('title') or 'Runtime artifact',
+        _sanitize_text(body.get('content') or ''),
+    )
+    runtime_append_event({
+        'taskId': artifact['taskId'],
+        'type': 'artifact.created',
+        'from': artifact['agentId'],
+        'to': 'ArtifactStore',
+        'content': f"{artifact['title']} saved",
+        'payload': {'artifactId': artifact['id'], 'type': artifact['type']},
+    })
+    return {'ok': True, 'artifact': artifact}
+
+
 def runtime_list_artifacts(task_id):
     """GET /api/runtime/artifacts/{taskId}：列出任务产物。"""
     try:
@@ -593,11 +662,25 @@ def _runtime_model_config(body):
     """组合请求配置和本地保存配置，请求配置优先但不要求前端传 API Key。"""
     saved = _runtime_json_read(_runtime_models_path(), {})
     incoming = body.get('config') if isinstance(body.get('config'), dict) else body
+    saved_model = {}
+    incoming_id = str(incoming.get('id') or '')
+    if not incoming_id and incoming.get('model'):
+        candidate = str(incoming.get('model'))
+        if any(isinstance(model, dict) and str(model.get('id')) == candidate for model in saved.get('models') or []):
+            incoming_id = candidate
+    if incoming_id:
+        for model in saved.get('models') or []:
+            if isinstance(model, dict) and str(model.get('id')) == incoming_id:
+                saved_model = model
+                break
+    model_name = incoming.get('model')
+    if saved_model and str(model_name or '') == incoming_id:
+        model_name = saved_model.get('model')
     return {
-        'provider': incoming.get('provider') or saved.get('provider') or 'openai-compatible',
-        'baseUrl': str(incoming.get('baseUrl') or saved.get('baseUrl') or '').rstrip('/'),
-        'apiKey': incoming.get('apiKey') or saved.get('apiKey') or '',
-        'model': incoming.get('model') or saved.get('model') or '',
+        'provider': incoming.get('provider') or saved_model.get('provider') or saved.get('provider') or 'openai-compatible',
+        'baseUrl': str(incoming.get('baseUrl') or saved_model.get('baseUrl') or saved.get('baseUrl') or '').rstrip('/'),
+        'apiKey': incoming.get('apiKey') or saved_model.get('apiKey') or saved.get('apiKey') or '',
+        'model': model_name or saved_model.get('model') or saved.get('model') or '',
     }
 
 
@@ -2794,6 +2877,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(data[0], data[1])
             else:
                 self.send_json(data)
+        elif p.startswith('/api/runtime/events/'):
+            task_id = p.replace('/api/runtime/events/', '')
+            data = runtime_get_events(task_id)
+            if isinstance(data, tuple):
+                self.send_json(data[0], data[1])
+            else:
+                self.send_json(data)
         elif p.startswith('/api/runtime/artifacts/'):
             task_id = p.replace('/api/runtime/artifacts/', '')
             data = runtime_list_artifacts(task_id)
@@ -2977,6 +3067,13 @@ class Handler(BaseHTTPRequestHandler):
         if p == '/api/runtime/events':
             try:
                 self.send_json(runtime_append_event(body))
+            except ValueError as e:
+                self.send_json({'ok': False, 'error': str(e)}, 400)
+            return
+
+        if p == '/api/runtime/artifacts':
+            try:
+                self.send_json(runtime_create_artifact(body))
             except ValueError as e:
                 self.send_json({'ok': False, 'error': str(e)}, 400)
             return

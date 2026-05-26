@@ -121,8 +121,12 @@ export const api = {
     fetchJ<RuntimeTaskResult>(`${API_BASE}/api/runtime/tasks/${encodeURIComponent(taskId)}`),
   runtimeEvent: (event: RuntimeEventPayload) =>
     postJ<ActionResult & { event?: RuntimeEventPayload }>(`${API_BASE}/api/runtime/events`, event),
+  runtimeEvents: (taskId: string) =>
+    fetchJ<RuntimeEventsResult>(`${API_BASE}/api/runtime/events/${encodeURIComponent(taskId)}`),
   runtimeArtifacts: (taskId: string) =>
     fetchJ<RuntimeArtifactsResult>(`${API_BASE}/api/runtime/artifacts/${encodeURIComponent(taskId)}`),
+  saveRuntimeArtifact: (artifact: RuntimeArtifactPayload) =>
+    postJ<ActionResult & { artifact?: RuntimeArtifact }>(`${API_BASE}/api/runtime/artifacts`, artifact),
   runtimeModelTest: (payload: RuntimeModelChatPayload) =>
     postJ<RuntimeModelChatResult>(`${API_BASE}/api/runtime/model/test`, payload),
   runtimeModelChat: (payload: RuntimeModelChatPayload) =>
@@ -462,6 +466,20 @@ export interface RuntimeModelConfig {
   model: string;
   mode: 'mock' | 'real';
   agentModels?: Record<string, string>;
+  models?: RuntimeModelProfile[];
+  updatedAt?: string;
+}
+
+export interface RuntimeModelProfile {
+  id: string;
+  name: string;
+  provider: 'openai-compatible';
+  baseUrl: string;
+  apiKey?: string;
+  apiKeyMasked?: string;
+  hasApiKey?: boolean;
+  model: string;
+  enabled?: boolean;
   updatedAt?: string;
 }
 
@@ -502,12 +520,25 @@ export interface RuntimeArtifact {
   createdAt: string;
 }
 
+export interface RuntimeArtifactPayload {
+  taskId: string;
+  agentId: string;
+  type: string;
+  title: string;
+  content: string;
+}
+
 export interface RuntimeTasksResult extends ActionResult {
   tasks: RuntimeTaskPayload[];
 }
 
 export interface RuntimeTaskResult extends ActionResult {
   task?: RuntimeTaskPayload;
+  events?: RuntimeEventPayload[];
+}
+
+export interface RuntimeEventsResult extends ActionResult {
+  taskId?: string;
   events?: RuntimeEventPayload[];
 }
 

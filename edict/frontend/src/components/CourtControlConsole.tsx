@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
-import { api, type AgentInfo, type OfficialInfo, type RuntimeModelConfig, type Task } from '../api';
+﻿import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
+import { api, type AgentInfo, type OfficialInfo, type RuntimeArtifact, type RuntimeEventPayload, type RuntimeModelConfig, type RuntimeModelProfile, type RuntimeTaskPayload, type Task } from '../api';
+import { ModelRouter } from '../modelRouter';
 import { DEPTS, isArchived, isEdict, useStore } from '../store';
 import { createCourtTask, createMockCourtRuntime, type AgentMessage, type CourtTask } from '../taskBus';
 
@@ -87,6 +88,22 @@ const DEFAULT_RUNTIME_CONFIG: RuntimeModelConfig = {
     taizi: '',
     zhongshu: '',
   },
+  models: [],
+};
+
+const ROUTABLE_AGENT_IDS = ['taizi', 'zhongshu', 'menxia', 'shangshu', 'libu', 'hubu', 'bingbu', 'xingbu', 'gongbu', 'libu_hr'];
+
+const ROUTABLE_AGENT_LABELS: Record<string, string> = {
+  taizi: '太子',
+  zhongshu: '中书省',
+  menxia: '门下省',
+  shangshu: '尚书省',
+  libu: '礼部',
+  hubu: '户部',
+  bingbu: '兵部',
+  xingbu: '刑部',
+  gongbu: '工部',
+  libu_hr: '吏部',
 };
 
 // 第一阶段保留原有皇上、太子、三省、六部体系，只补充用于 UI 展示的职责文案。
@@ -194,6 +211,41 @@ function maskKey(key: string) {
   return `${key.slice(0, 4)}••••${key.slice(-4)}`;
 }
 
+function modelKeyLabel(model: RuntimeModelProfile) {
+  if (model.apiKey) return maskKey(model.apiKey);
+  return model.apiKeyMasked || (model.hasApiKey ? '已保存' : '未填写');
+}
+
+function createRuntimeModelProfile(): RuntimeModelProfile {
+  const stamp = Date.now().toString(36);
+  return {
+    id: `model-${stamp}`,
+    name: `模型 ${stamp.slice(-4).toUpperCase()}`,
+    provider: 'openai-compatible',
+    baseUrl: '',
+    apiKey: '',
+    model: '',
+    enabled: true,
+  };
+}
+
+function hydrateRuntimeConfig(config: RuntimeModelConfig): RuntimeModelConfig {
+  return {
+    ...DEFAULT_RUNTIME_CONFIG,
+    ...config,
+    apiKey: '',
+    agentModels: {
+      ...DEFAULT_RUNTIME_CONFIG.agentModels,
+      ...(config.agentModels || {}),
+    },
+    models: (config.models || []).map((model) => ({ ...model, apiKey: '' })),
+  };
+}
+
+function historySummary(task: RuntimeTaskPayload) {
+  return String(task.content || task.title || '').replace(/\s+/g, ' ').slice(0, 96);
+}
+
 function makeLocalTaskId() {
   // 本地模拟任务 ID 使用时间戳和随机后缀，避免与真实后端任务冲突。
   const stamp = new Date()
@@ -244,6 +296,47 @@ function mapRuntimeTaskToView(task: CourtTask): SimulatedDecreeTask {
   };
 }
 
+function mapHistoryTaskToView(task: RuntimeTaskPayload, events: RuntimeEventPayload[] = [], replayIndex = events.length): SimulatedDecreeTask {
+  const visibleEvents = events.slice(0, replayIndex);
+  const lastEvent = visibleEvents[visibleEvents.length - 1];
+  const lastTarget = String(lastEvent?.to || task.currentDepartment || '皇上');
+  const currentStep = FLOW_DEPARTMENT_MAP[lastTarget] || FLOW_DEPARTMENT_MAP[String(task.currentDepartment || '')] || FLOW_STEPS[Math.min(replayIndex, FLOW_STEPS.length - 1)] || FLOW_STEPS[0];
+  const activeIndex = Math.max(FLOW_STEPS.indexOf(currentStep), 0);
+  const done = task.status === 'completed' || replayIndex >= events.length;
+  return {
+    id: String(task.id),
+    title: String(task.title || historySummary(task) || task.id),
+    createdAt: String(task.createdAt || ''),
+    status: (done ? '已完成' : '流转中') as SimulatedDecreeTask['status'],
+    currentStep: done ? '历史回放完成' : currentStep,
+    steps: FLOW_STEPS.map((name, index) => ({
+      name,
+      status: done || index < activeIndex ? 'done' : index === activeIndex ? 'active' : 'pending',
+      startedAt: String(visibleEvents[index]?.createdAt || (visibleEvents[index] as { at?: string } | undefined)?.at || task.updatedAt || ''),
+      finishedAt: index < activeIndex ? String(lastEvent?.createdAt || task.updatedAt || '') : undefined,
+      log: index === activeIndex && !done ? '历史事件回放中' : index < activeIndex || done ? '历史事件已回放' : '等待回放',
+      detail: STEP_DETAILS[name] || '历史事件回放',
+    })),
+    logs: visibleEvents.map((event) => ({
+      at: String(event.createdAt || ''),
+      step: String(event.from || ''),
+      text: String(event.content || ''),
+    })),
+  };
+}
+
+function artifactPreview(artifact?: RuntimeArtifact) {
+  if (!artifact) return '';
+  if (artifact.type === 'json') {
+    try {
+      return JSON.stringify(JSON.parse(artifact.content), null, 2);
+    } catch {
+      return artifact.content;
+    }
+  }
+  return artifact.content;
+}
+
 function messageToRuntimeLog(message: AgentMessage): RuntimeEventLog {
   // 将 AgentMessage 规范化为 UI 日志行，保留 from/to/type/content/timestamp。
   return {
@@ -282,6 +375,13 @@ export default function CourtControlConsole() {
   const [modelCallLogs, setModelCallLogs] = useState<ModelCallLog[]>([]);
   const [savingRuntimeConfig, setSavingRuntimeConfig] = useState(false);
   const [testingModel, setTestingModel] = useState(false);
+  const [runtimeTasks, setRuntimeTasks] = useState<RuntimeTaskPayload[]>([]);
+  const [runtimeTaskMeta, setRuntimeTaskMeta] = useState<Record<string, { eventCount: number; artifactCount: number }>>({});
+  const [selectedHistoryTaskId, setSelectedHistoryTaskId] = useState('');
+  const [historyEvents, setHistoryEvents] = useState<RuntimeEventPayload[]>([]);
+  const [artifacts, setArtifacts] = useState<RuntimeArtifact[]>([]);
+  const [selectedArtifactId, setSelectedArtifactId] = useState('');
+  const [replayingTaskId, setReplayingTaskId] = useState('');
 
   useEffect(() => {
     loadAgentConfig();
@@ -290,15 +390,7 @@ export default function CourtControlConsole() {
     api.runtimeConfig()
       .then((result) => {
         if (result.ok && result.config) {
-          setRuntimeConfig({
-            ...DEFAULT_RUNTIME_CONFIG,
-            ...result.config,
-            apiKey: '',
-            agentModels: {
-              ...DEFAULT_RUNTIME_CONFIG.agentModels,
-              ...(result.config.agentModels || {}),
-            },
-          });
+          setRuntimeConfig(hydrateRuntimeConfig(result.config));
         }
       })
       .catch(() => {
@@ -310,6 +402,37 @@ export default function CourtControlConsole() {
         }, ...prev]);
       });
   }, [loadAgentConfig, loadOfficials]);
+
+  const refreshRuntimeHistory = async () => {
+    try {
+      const result = await api.runtimeTasks();
+      if (!result.ok) return;
+      setRuntimeTasks(result.tasks || []);
+      const metaEntries = await Promise.all((result.tasks || []).slice(0, 30).map(async (task) => {
+        const taskId = String(task.id);
+        try {
+          const [eventsResult, artifactsResult] = await Promise.all([
+            api.runtimeEvents(taskId),
+            api.runtimeArtifacts(taskId),
+          ]);
+          return [taskId, {
+            eventCount: eventsResult.events?.length || 0,
+            artifactCount: artifactsResult.artifacts?.length || 0,
+          }] as const;
+        } catch {
+          return [taskId, { eventCount: 0, artifactCount: 0 }] as const;
+        }
+      }));
+      setRuntimeTaskMeta(Object.fromEntries(metaEntries));
+      setSelectedHistoryTaskId((current) => current || result.tasks?.[0]?.id || '');
+    } catch (error) {
+      pushModelLog('RuntimeHistory', 'err', error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  useEffect(() => {
+    void refreshRuntimeHistory();
+  }, []);
 
   useEffect(() => {
     // 订阅 TaskBus 全量事件，将 Agent 通信、任务更新和状态广播实时映射到 UI。
@@ -327,6 +450,29 @@ export default function CourtControlConsole() {
     });
     return unsubscribe;
   }, []);
+
+  useEffect(() => {
+    if (!selectedHistoryTaskId) return;
+    let cancelled = false;
+    Promise.all([
+      api.runtimeEvents(selectedHistoryTaskId),
+      api.runtimeArtifacts(selectedHistoryTaskId),
+    ]).then(([eventsResult, artifactsResult]) => {
+      if (cancelled) return;
+      const nextEvents = eventsResult.events || [];
+      const nextArtifacts = artifactsResult.artifacts || [];
+      setHistoryEvents(nextEvents);
+      setArtifacts(nextArtifacts);
+      setSelectedArtifactId((current) => current && nextArtifacts.some((artifact) => artifact.id === current) ? current : nextArtifacts[0]?.id || '');
+      setRuntimeTaskMeta((prev) => ({
+        ...prev,
+        [selectedHistoryTaskId]: { eventCount: nextEvents.length, artifactCount: nextArtifacts.length },
+      }));
+    }).catch((error) => {
+      pushModelLog('RuntimeHistory', 'err', error instanceof Error ? error.message : String(error));
+    });
+    return () => { cancelled = true; };
+  }, [selectedHistoryTaskId]);
 
   const tasks = liveStatus?.tasks || [];
   const activeEdicts = tasks.filter((t) => isEdict(t) && !isArchived(t));
@@ -393,6 +539,8 @@ export default function CourtControlConsole() {
   const threeDepartments = agents.filter((agent) => ['zhongshu', 'menxia', 'shangshu'].includes(agent.id));
   const sixDepartments = agents.filter((agent) => ['hubu', 'libu', 'bingbu', 'xingbu', 'gongbu', 'libu_hr'].includes(agent.id));
   const taizi = agents.find((agent) => agent.id === 'taizi');
+  const selectedHistoryTask = runtimeTasks.find((task) => task.id === selectedHistoryTaskId);
+  const selectedArtifact = artifacts.find((artifact) => artifact.id === selectedArtifactId) || artifacts[0];
 
   const updateSelectedConfig = (field: keyof LocalModelConfig, value: string | boolean) => {
     // 表单变更立即进入 React 状态，点击保存后落到 localStorage。
@@ -438,21 +586,43 @@ export default function CourtControlConsole() {
     }));
   };
 
+  const updateRuntimeModel = (modelId: string, field: keyof RuntimeModelProfile, value: string | boolean) => {
+    setRuntimeConfig((prev) => ({
+      ...prev,
+      models: (prev.models || []).map((model) => (
+        model.id === modelId ? { ...model, [field]: value } : model
+      )),
+    }));
+  };
+
+  const addRuntimeModel = () => {
+    const model = createRuntimeModelProfile();
+    setRuntimeConfig((prev) => ({
+      ...prev,
+      models: [...(prev.models || []), model],
+    }));
+  };
+
+  const deleteRuntimeModel = (modelId: string) => {
+    setRuntimeConfig((prev) => {
+      const nextAgentModels = Object.fromEntries(
+        Object.entries(prev.agentModels || {}).map(([agentId, boundId]) => [agentId, boundId === modelId ? '' : boundId]),
+      );
+      return {
+        ...prev,
+        models: (prev.models || []).filter((model) => model.id !== modelId),
+        agentModels: nextAgentModels,
+      };
+    });
+  };
+
   const handleSaveRuntimeConfig = async () => {
     // 保存真实模型配置到后端，API Key 不进入前端日志。
     setSavingRuntimeConfig(true);
     try {
       const result = await api.saveRuntimeConfig(runtimeConfig);
       if (result.ok) {
-        setRuntimeConfig({
-          ...DEFAULT_RUNTIME_CONFIG,
-          ...result.config,
-          apiKey: '',
-          agentModels: {
-            ...DEFAULT_RUNTIME_CONFIG.agentModels,
-            ...(result.config.agentModels || {}),
-          },
-        });
+        setRuntimeConfig(hydrateRuntimeConfig(result.config));
         pushModelLog('Runtime', 'ok', `模型配置已保存，Key：${result.config.apiKeyMasked || '未填写'}`);
         toast('后端 Runtime 模型配置已保存', 'ok');
       } else {
@@ -505,30 +675,20 @@ export default function CourtControlConsole() {
     }
   };
 
-  const callRuntimeModel = async (task: CourtTask, agentId: 'taizi' | 'zhongshu', title: string, prompt: string) => {
-    // 真实模型调用统一走后端代理，输出会在后端保存为 Artifact。
-    const agentName = agentId === 'taizi' ? '太子' : '中书省';
-    pushModelLog(agentName, 'info', `开始调用真实模型：${title}`);
-    const result = await api.runtimeModelChat({
+  const callRuntimeModel = async (task: CourtTask, agentId: string, title: string, prompt: string, fallback?: string) => {
+    const router = new ModelRouter(runtimeConfig, pushModelLog);
+    const routed = await router.generate({
       taskId: task.id,
       agentId,
-      config: {
-        ...runtimeConfig,
-        model: runtimeConfig.agentModels?.[agentId] || runtimeConfig.model,
-      },
+      title,
+      fallback: fallback || `${ROUTABLE_AGENT_LABELS[agentId] || agentId} mock output: ${title} for ${task.title}`,
       messages: [
-        { role: 'system', content: agentId === 'taizi' ? '你是太子，负责分析圣旨并制定朝堂调度策略。' : '你是中书省，负责拆解圣旨并形成可执行方案。' },
+        { role: 'system', content: `你是${ROUTABLE_AGENT_LABELS[agentId] || agentId}，请按当前职责处理圣旨，不泄露 API Key。` },
         { role: 'user', content: prompt },
       ],
       timeoutSec: 60,
     });
-    if (!result.ok) {
-      const error = result.error || `${agentName} 模型调用失败`;
-      pushModelLog(agentName, 'err', error);
-      throw new Error(error);
-    }
-    pushModelLog(agentName, 'ok', `${title} 完成，产物：${result.artifact?.id || '已保存'}`);
-    return result.message || '模型返回为空，但调用成功。';
+    return routed.content;
   };
 
   const runRealRuntimeFlow = async (task: CourtTask) => {
@@ -632,6 +792,40 @@ export default function CourtControlConsole() {
     } else {
       runtimeRef.current.orchestrator.receiveTask(task);
       toast(`${task.id} 已进入 TaskBus，Agent Runtime 开始流转`, 'ok');
+    }
+  };
+
+  const handleReplayTask = async (taskId: string) => {
+    const task = runtimeTasks.find((item) => item.id === taskId);
+    if (!task) return;
+    setSelectedHistoryTaskId(taskId);
+    setReplayingTaskId(taskId);
+    try {
+      const result = await api.runtimeEvents(taskId);
+      const events = result.events || [];
+      setRuntimeLogs([]);
+      setSimulatedTasks((prev) => [mapHistoryTaskToView(task, events, 0), ...prev.filter((item) => item.id !== taskId)]);
+      setActiveSimTaskId(taskId);
+      for (let index = 0; index < events.length; index += 1) {
+        await componentWait(260);
+        const event = events[index];
+        setRuntimeLogs((prev) => [{
+          at: String(event.createdAt || ''),
+          from: String(event.from || ''),
+          to: String(event.to || ''),
+          type: event.type,
+          content: event.content,
+        }, ...prev].slice(0, 80));
+        setSimulatedTasks((prev) => [
+          mapHistoryTaskToView(task, events, index + 1),
+          ...prev.filter((item) => item.id !== taskId),
+        ]);
+      }
+      pushModelLog('Replay', 'ok', `${taskId} 历史事件回放完成，未重新调用模型或工具。`);
+    } catch (error) {
+      pushModelLog('Replay', 'err', error instanceof Error ? error.message : String(error));
+    } finally {
+      setReplayingTaskId('');
     }
   };
 
@@ -777,6 +971,39 @@ export default function CourtControlConsole() {
             </button>
           </div>
         </div>
+        <div className="runtime-model-list">
+          {(runtimeConfig.models || []).length === 0 ? (
+            <div className="log-empty">暂无独立模型。新增模型后可绑定到任一官职；未绑定的 Agent 自动使用 mock。</div>
+          ) : (
+            (runtimeConfig.models || []).map((model) => (
+              <div className="runtime-model-item" key={model.id}>
+                <input value={model.name} onChange={(e) => updateRuntimeModel(model.id, 'name', e.target.value)} placeholder="模型名称" />
+                <input value={model.baseUrl} onChange={(e) => updateRuntimeModel(model.id, 'baseUrl', e.target.value)} placeholder="Base URL" />
+                <input type="password" value={model.apiKey || ''} onChange={(e) => updateRuntimeModel(model.id, 'apiKey', e.target.value)} placeholder={`API Key：${modelKeyLabel(model)}`} />
+                <input value={model.model} onChange={(e) => updateRuntimeModel(model.id, 'model', e.target.value)} placeholder="模型 ID" />
+                <label className="runtime-model-enabled">
+                  <input type="checkbox" checked={model.enabled !== false} onChange={(e) => updateRuntimeModel(model.id, 'enabled', e.target.checked)} />
+                  启用
+                </label>
+                <button className="console-ghost danger" onClick={() => deleteRuntimeModel(model.id)}>删除</button>
+              </div>
+            ))
+          )}
+          <button className="console-ghost" onClick={addRuntimeModel}>新增模型</button>
+        </div>
+        <div className="runtime-agent-bindings">
+          {ROUTABLE_AGENT_IDS.map((agentId) => (
+            <label key={agentId}>
+              <span>{ROUTABLE_AGENT_LABELS[agentId]}</span>
+              <select value={runtimeConfig.agentModels?.[agentId] || ''} onChange={(e) => updateRuntimeAgentModel(agentId, e.target.value)}>
+                <option value="">Mock / 未绑定</option>
+                {(runtimeConfig.models || []).map((model) => (
+                  <option key={model.id} value={model.id}>{model.name || model.id} · {model.model || '未填写模型'}</option>
+                ))}
+              </select>
+            </label>
+          ))}
+        </div>
         <div className="console-log model-call-log">
           {modelCallLogs.length === 0 ? (
             <div className="log-empty">暂无模型调用日志。API Key 不会在此处完整显示。</div>
@@ -855,6 +1082,63 @@ export default function CourtControlConsole() {
           </div>
         </div>
       )}
+
+      <div className="runtime-history-layout">
+        <div className="console-card runtime-history-card">
+          <div className="console-card-head">
+            <span>圣旨档案 / 历史任务</span>
+            <small>{runtimeTasks.length} 条</small>
+          </div>
+          <div className="runtime-history-list">
+            {runtimeTasks.length === 0 ? (
+              <div className="log-empty">暂无 Runtime 历史任务。</div>
+            ) : runtimeTasks.map((task) => {
+              const meta = runtimeTaskMeta[String(task.id)] || { eventCount: 0, artifactCount: 0 };
+              return (
+                <button
+                  key={String(task.id)}
+                  className={`runtime-history-item ${selectedHistoryTaskId === task.id ? 'selected' : ''}`}
+                  onClick={() => setSelectedHistoryTaskId(String(task.id))}
+                >
+                  <span>{String(task.id)}</span>
+                  <b>{historySummary(task) || String(task.title || task.id)}</b>
+                  <small>状态：{String(task.status || 'created')} · 创建：{String(task.createdAt || '-')} · 更新：{String(task.updatedAt || '-')}</small>
+                  <em>事件 {meta.eventCount} · 产物 {meta.artifactCount}</em>
+                  <i onClick={(event) => { event.stopPropagation(); void handleReplayTask(String(task.id)); }}>
+                    {replayingTaskId === task.id ? '回放中' : '回放'}
+                  </i>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="console-card artifact-viewer-card">
+          <div className="console-card-head">
+            <span>Artifact Viewer</span>
+            <small>{selectedHistoryTask?.id || '未选择任务'}</small>
+          </div>
+          <div className="artifact-viewer">
+            <div className="artifact-list">
+              {artifacts.length === 0 ? (
+                <div className="log-empty">暂无产物。</div>
+              ) : artifacts.map((artifact) => (
+                <button
+                  key={artifact.id}
+                  className={selectedArtifact?.id === artifact.id ? 'selected' : ''}
+                  onClick={() => setSelectedArtifactId(artifact.id)}
+                >
+                  <b>{artifact.title}</b>
+                  <span>{artifact.type} · {artifact.agentId}</span>
+                </button>
+              ))}
+            </div>
+            <pre className={`artifact-preview ${selectedArtifact?.type || 'text'}`}>
+              {selectedArtifact ? artifactPreview(selectedArtifact) : '选择左侧产物查看内容。'}
+            </pre>
+          </div>
+        </div>
+      </div>
 
       <div className="agent-console-layout">
         <div className="agent-card-grid">

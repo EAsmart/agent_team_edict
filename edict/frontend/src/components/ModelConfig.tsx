@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useStore } from '../store';
-import { api } from '../api';
+import { api, type RuntimeModelConfig, type RuntimeModelProfile } from '../api';
 
 const FALLBACK_MODELS = [
   { id: 'anthropic/claude-sonnet-4-6', l: 'Claude Sonnet 4.6', p: 'Anthropic' },
@@ -25,6 +25,43 @@ const CHANNELS = [
   { id: 'tui', label: 'TUI (终端)' },
 ];
 
+const ROUTABLE_AGENT_IDS = ['taizi', 'zhongshu', 'menxia', 'shangshu', 'libu', 'hubu', 'bingbu', 'xingbu', 'gongbu', 'libu_hr'];
+const ROUTABLE_AGENT_LABELS: Record<string, string> = {
+  taizi: '太子',
+  zhongshu: '中书省',
+  menxia: '门下省',
+  shangshu: '尚书省',
+  libu: '礼部',
+  hubu: '户部',
+  bingbu: '兵部',
+  xingbu: '刑部',
+  gongbu: '工部',
+  libu_hr: '吏部',
+};
+
+const DEFAULT_RUNTIME_CONFIG: RuntimeModelConfig = {
+  provider: 'openai-compatible',
+  baseUrl: '',
+  apiKey: '',
+  model: '',
+  mode: 'mock',
+  agentModels: {},
+  models: [],
+};
+
+function newRuntimeModel(): RuntimeModelProfile {
+  const stamp = Date.now().toString(36);
+  return {
+    id: `model-${stamp}`,
+    name: `模型 ${stamp.slice(-4).toUpperCase()}`,
+    provider: 'openai-compatible',
+    baseUrl: '',
+    apiKey: '',
+    model: '',
+    enabled: true,
+  };
+}
+
 export default function ModelConfig() {
   const agentConfig = useStore((s) => s.agentConfig);
   const changeLog = useStore((s) => s.changeLog);
@@ -35,9 +72,22 @@ export default function ModelConfig() {
   const [statusMap, setStatusMap] = useState<Record<string, { cls: string; text: string }>>({});
   const [channelSel, setChannelSel] = useState('feishu');
   const [channelStatus, setChannelStatus] = useState('');
+  const [runtimeConfig, setRuntimeConfig] = useState<RuntimeModelConfig>(DEFAULT_RUNTIME_CONFIG);
+  const [runtimeStatus, setRuntimeStatus] = useState('');
 
   useEffect(() => {
     loadAgentConfig();
+    api.runtimeConfig().then((result) => {
+      if (result.ok && result.config) {
+        setRuntimeConfig({
+          ...DEFAULT_RUNTIME_CONFIG,
+          ...result.config,
+          apiKey: '',
+          agentModels: result.config.agentModels || {},
+          models: (result.config.models || []).map((model) => ({ ...model, apiKey: '' })),
+        });
+      }
+    }).catch(() => setRuntimeStatus('Runtime 配置读取失败'));
   }, [loadAgentConfig]);
 
   useEffect(() => {
@@ -88,6 +138,30 @@ export default function ModelConfig() {
     }
   };
 
+  const updateRuntimeModel = (modelId: string, field: keyof RuntimeModelProfile, value: string | boolean) => {
+    setRuntimeConfig((prev) => ({
+      ...prev,
+      models: (prev.models || []).map((model) => model.id === modelId ? { ...model, [field]: value } : model),
+    }));
+  };
+
+  const saveRuntime = async () => {
+    const result = await api.saveRuntimeConfig(runtimeConfig);
+    if (result.ok) {
+      setRuntimeConfig({
+        ...DEFAULT_RUNTIME_CONFIG,
+        ...result.config,
+        apiKey: '',
+        agentModels: result.config.agentModels || {},
+        models: (result.config.models || []).map((model) => ({ ...model, apiKey: '' })),
+      });
+      setRuntimeStatus('Runtime 模型配置已保存');
+      toast('Runtime 模型配置已保存', 'ok');
+    } else {
+      setRuntimeStatus(result.error || 'Runtime 模型配置保存失败');
+    }
+  };
+
   return (
     <div>
       <div className="model-grid">
@@ -132,6 +206,59 @@ export default function ModelConfig() {
       </div>
 
       {/* Dispatch Channel 配置 */}
+      <div className="console-card runtime-model-card" style={{ marginTop: 18 }}>
+        <div className="console-card-head">
+          <span>Runtime 独立模型绑定</span>
+          <small>{runtimeConfig.mode === 'real' ? '真实模型模式' : 'Mock 模式'}</small>
+        </div>
+        <div className="local-config-form runtime-config-form">
+          <label>
+            <span>运行模式</span>
+            <select value={runtimeConfig.mode} onChange={(e) => setRuntimeConfig((prev) => ({ ...prev, mode: e.target.value as RuntimeModelConfig['mode'] }))}>
+              <option value="mock">Mock 模式</option>
+              <option value="real">真实模型模式</option>
+            </select>
+          </label>
+          <div className="runtime-config-actions">
+            <button className="btn btn-p" onClick={() => setRuntimeConfig((prev) => ({ ...prev, models: [...(prev.models || []), newRuntimeModel()] }))}>新增模型</button>
+            <button className="btn btn-g" onClick={() => void saveRuntime()}>保存 Runtime 配置</button>
+            {runtimeStatus && <span style={{ fontSize: 12, color: 'var(--muted)' }}>{runtimeStatus}</span>}
+          </div>
+        </div>
+        <div className="runtime-model-list">
+          {(runtimeConfig.models || []).map((model) => (
+            <div className="runtime-model-item" key={model.id}>
+              <input value={model.name} onChange={(e) => updateRuntimeModel(model.id, 'name', e.target.value)} placeholder="名称" />
+              <input value={model.baseUrl} onChange={(e) => updateRuntimeModel(model.id, 'baseUrl', e.target.value)} placeholder="Base URL" />
+              <input type="password" value={model.apiKey || ''} onChange={(e) => updateRuntimeModel(model.id, 'apiKey', e.target.value)} placeholder={model.apiKeyMasked || (model.hasApiKey ? 'API Key 已保存' : 'API Key')} />
+              <input value={model.model} onChange={(e) => updateRuntimeModel(model.id, 'model', e.target.value)} placeholder="模型 ID" />
+              <label className="runtime-model-enabled">
+                <input type="checkbox" checked={model.enabled !== false} onChange={(e) => updateRuntimeModel(model.id, 'enabled', e.target.checked)} />
+                启用
+              </label>
+              <button className="btn btn-g" onClick={() => setRuntimeConfig((prev) => ({
+                ...prev,
+                models: (prev.models || []).filter((item) => item.id !== model.id),
+                agentModels: Object.fromEntries(Object.entries(prev.agentModels || {}).map(([agentId, bound]) => [agentId, bound === model.id ? '' : bound])),
+              }))}>删除</button>
+            </div>
+          ))}
+        </div>
+        <div className="runtime-agent-bindings">
+          {ROUTABLE_AGENT_IDS.map((agentId) => (
+            <label key={agentId}>
+              <span>{ROUTABLE_AGENT_LABELS[agentId]}</span>
+              <select value={runtimeConfig.agentModels?.[agentId] || ''} onChange={(e) => setRuntimeConfig((prev) => ({ ...prev, agentModels: { ...(prev.agentModels || {}), [agentId]: e.target.value } }))}>
+                <option value="">Mock / 未绑定</option>
+                {(runtimeConfig.models || []).map((model) => (
+                  <option key={model.id} value={model.id}>{model.name || model.id} · {model.model || '未填写模型'}</option>
+                ))}
+              </select>
+            </label>
+          ))}
+        </div>
+      </div>
+
       <div style={{ marginTop: 24, marginBottom: 8 }}>
         <div className="sec-title">派发渠道</div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 0' }}>
